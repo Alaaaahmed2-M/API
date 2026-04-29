@@ -10,7 +10,7 @@ os.makedirs("tts_outputs", exist_ok=True)
 
 tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False, gpu=False)
 
-male_speakers = ["Andrew Chipper"]
+male_speakers = ["Craig Gutsy"]
 female_speakers = ["Gracie Wise"]
 
 speaker_indices = {"male": 0, "female": 0}
