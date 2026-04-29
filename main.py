@@ -1,6 +1,7 @@
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import io
 import os
 from TTS.api import TTS
 from pydub import AudioSegment
@@ -9,104 +10,86 @@ app = FastAPI()
 
 os.makedirs("tts_outputs", exist_ok=True)
 
-tts = TTS(
-    model_name="tts_models/multilingual/multi-dataset/xtts_v2",
-    progress_bar=False,
-    gpu=False
-)
+tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False, gpu=False)
 
-available_speakers = tts.speakers
-
-male_candidates = ["Craig Gutsy"]
-female_candidates = ["Gracie Wise"]
-
-male_speakers = [s for s in male_candidates if s in available_speakers] or [available_speakers[0]]
-female_speakers = [s for s in female_candidates if s in available_speakers] or [available_speakers[0]]
-
+male_speakers = ["Craig Gutsy"]
+female_speakers = ["Gracie Wise"]
 speaker_indices = {"male": 0, "female": 0}
 
-
-class TTSRequest(BaseModel):
-    text: str
-    language: str
-    gender: str
-
-
 def get_next_speaker(gender):
-    speakers = male_speakers if gender == "male" else female_speakers
     index = speaker_indices[gender]
+    speakers = male_speakers if gender == "male" else female_speakers
     speaker = speakers[index]
     speaker_indices[gender] = (index + 1) % len(speakers)
     return speaker
 
+def split_text(text, max_length=160):
+    sentences = []
+    while len(text) > max_length:
+        split_index = text.rfind(" ", 0, max_length)
+        if split_index == -1:
+            split_index = max_length
+        sentences.append(text[:split_index].strip())
+        text = text[split_index:].strip()
+    if text:
+        sentences.append(text)
+    return sentences
 
-def split_text(text, max_length=400, min_words=100):
-    words = text.split()
-
-    if len(words) <= min_words:
-        return [text]
-
-    parts = []
-    current = []
-
-    for word in words:
-        current.append(word)
-        current_text = " ".join(current)
-
-        if len(current) >= min_words and len(current_text) >= max_length:
-            parts.append(current_text)
-            current = []
-
-    if current:
-        parts.append(" ".join(current))
-
-    return parts
-
-
-def get_next_filename():
-    i = 1
-    while True:
-        path = os.path.join("tts_outputs", f"output_{i}.wav")
-        if not os.path.exists(path):
-            return path
-        i += 1
-
+class TTSRequest(BaseModel):
+    text: str
+    language: str = "en"
+    gender: str = "male"
 
 @app.post("/tts")
-def generate_tts(req: TTSRequest):
-    speaker = get_next_speaker(req.gender)
-    output_path = get_next_filename()
+def generate_tts(request: TTSRequest):
+    text = request.text.strip()
+    lang = request.language
+    gender = request.gender.lower()
 
-    parts = split_text(req.text)
+    # Validation
+    if not text:
+        raise HTTPException(status_code=422, detail="Text cannot be empty")
+    if gender not in ["male", "female"]:
+        raise HTTPException(status_code=422, detail="Gender must be 'male' or 'female'")
+    supported_languages = ["ar", "en", "fr", "es", "de", "it", "tr", "ru", "hi"]
+    if lang not in supported_languages:
+        raise HTTPException(status_code=422, detail=f"Language must be one of {supported_languages}")
 
-    combined_audio = AudioSegment.empty()
+    speaker = get_next_speaker(gender)
+    parts = split_text(text)
     temp_files = []
 
-    for i, part in enumerate(parts, start=1):
-        temp_file = f"tts_outputs/temp_{i}.wav"
+    try:
+        for i, part in enumerate(parts, start=1):
+            temp_file = os.path.join("tts_outputs", f"temp_part_{i}.wav")
+            tts.tts_to_file(
+                text=part,
+                speaker=speaker,
+                language=lang,
+                file_path=temp_file
+            )
+            temp_files.append(temp_file)
 
-        tts.tts_to_file(
-            text=part,
-            speaker=speaker,
-            language=req.language,
-            file_path=temp_file
+        combined_audio = None
+        for f in temp_files:
+            segment = AudioSegment.from_wav(f)
+            combined_audio = segment if combined_audio is None else combined_audio + segment
+
+        # ✅ بدل ما نحفظ ملف، نكتب الصوت في الذاكرة مباشرة
+        audio_buffer = io.BytesIO()
+        combined_audio.export(audio_buffer, format="wav")
+        audio_buffer.seek(0)
+
+        return StreamingResponse(
+            audio_buffer,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": f'attachment; filename="{speaker.replace(" ", "_")}.wav"'
+            }
         )
 
-        temp_files.append(temp_file)
-
-    for file in temp_files:
-        combined_audio += AudioSegment.from_wav(file)
-
-    combined_audio.export(output_path, format="wav")
-
-    for file in temp_files:
-        try:
-            os.remove(file)
-        except Exception:
-            pass
-
-    return FileResponse(
-        path=output_path,
-        media_type="audio/wav",
-        filename=os.path.basename(output_path)
-    )
+    finally:
+        # تنظيف الملفات المؤقتة دايمًا حتى لو في error
+        for f in temp_files:
+            if os.path.exists(f):
+                os.remove(f)
