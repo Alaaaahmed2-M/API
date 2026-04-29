@@ -1,102 +1,110 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI
 from pydantic import BaseModel
+import os
 from TTS.api import TTS
 from pydub import AudioSegment
-import os, uuid
 
-app = FastAPI(title="TTS API", description="Coqui XTTS - Text to Speech API")
-
-tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False, gpu=False)
+app = FastAPI()
 
 os.makedirs("tts_outputs", exist_ok=True)
 
-male_speakers   = ["Luis Moray", "Andrew Chipper"]
-female_speakers = ["Daisy Studious", "Gracie Wise"]
+tts = TTS(
+    model_name="tts_models/multilingual/multi-dataset/xtts_v2",
+    progress_bar=False,
+    gpu=False
+)
 
-SUPPORTED_LANGUAGES = ["ar", "en", "fr", "es", "de", "it", "tr", "ru", "hi"]
+available_speakers = tts.speakers
+
+male_candidates = ["Craig Gutsy"]
+female_candidates = ["Gracie Wise"]
+
+male_speakers = [s for s in male_candidates if s in available_speakers] or [available_speakers[0]]
+female_speakers = [s for s in female_candidates if s in available_speakers] or [available_speakers[0]]
+
+speaker_indices = {"male": 0, "female": 0}
 
 
 class TTSRequest(BaseModel):
     text: str
-    language: str = "en"   # ar, en, fr, es, de, it, tr, ru, hi
-    gender: str   = "female"  # male or female
-    speaker_index: int = 0    # 0 or 1
+    language: str
+    gender: str
 
 
-def split_text(text, max_length=160):
-    sentences = []
-    while len(text) > max_length:
-        split_index = text.rfind(" ", 0, max_length)
-        if split_index == -1:
-            split_index = max_length
-        sentences.append(text[:split_index].strip())
-        text = text[split_index:].strip()
-    if text:
-        sentences.append(text)
-    return sentences
+def get_next_speaker(gender):
+    speakers = male_speakers if gender == "male" else female_speakers
+    index = speaker_indices[gender]
+    speaker = speakers[index]
+    speaker_indices[gender] = (index + 1) % len(speakers)
+    return speaker
 
-# ---------- Endpoints ----------
-@app.get("/")
-def root():
-    return {"message": "TTS API is running ✅"}
+
+def split_text(text, max_length=400, min_words=100):
+    words = text.split()
+
+    if len(words) <= min_words:
+        return [text]
+
+    parts = []
+    current = []
+
+    for word in words:
+        current.append(word)
+        current_text = " ".join(current)
+
+        if len(current) >= min_words and len(current_text) >= max_length:
+            parts.append(current_text)
+            current = []
+
+    if current:
+        parts.append(" ".join(current))
+
+    return parts
+
+
+def get_next_filename():
+    i = 1
+    while True:
+        path = os.path.join("tts_outputs", f"output_{i}.wav")
+        if not os.path.exists(path):
+            return path
+        i += 1
+
 
 @app.post("/tts")
-def synthesize(req: TTSRequest):
-    # Validate
-    if not req.text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
-    if req.language not in SUPPORTED_LANGUAGES:
-        raise HTTPException(status_code=400, detail=f"Unsupported language. Choose from: {SUPPORTED_LANGUAGES}")
-    if req.gender not in ["male", "female"]:
-        raise HTTPException(status_code=400, detail="Gender must be 'male' or 'female'.")
+def generate_tts(req: TTSRequest):
+    speaker = get_next_speaker(req.gender)
+    output_path = get_next_filename()
 
-
-    speakers = male_speakers if req.gender == "male" else female_speakers
-    idx = req.speaker_index % len(speakers)
-    speaker = speakers[idx]
-
-    # Output file
-    output_path = os.path.join("tts_outputs", f"{uuid.uuid4()}.wav")
     parts = split_text(req.text)
+
+    combined_audio = AudioSegment.empty()
     temp_files = []
 
-    try:
-        for i, part in enumerate(parts, start=1):
-            temp_file = os.path.join("tts_outputs", f"temp_{uuid.uuid4()}.wav")
-            tts.tts_to_file(
-                text=part,
-                speaker=speaker,
-                language=req.language,
-                file_path=temp_file
-            )
-            temp_files.append(temp_file)
+    for i, part in enumerate(parts, start=1):
+        temp_file = f"tts_outputs/temp_{i}.wav"
 
+        tts.tts_to_file(
+            text=part,
+            speaker=speaker,
+            language=req.language,
+            file_path=temp_file
+        )
 
-        combined = None
-        for f in temp_files:
-            seg = AudioSegment.from_wav(f)
-            combined = seg if combined is None else combined + seg
+        temp_files.append(temp_file)
 
-        combined.export(output_path, format="wav")
+    for f in temp_files:
+        combined_audio += AudioSegment.from_wav(f)
 
-    finally:
-        for f in temp_files:
-            if os.path.exists(f):
-                os.remove(f)
+    combined_audio.export(output_path, format="wav")
 
+    for f in temp_files:
+        try:
+            os.remove(f)
+        except:
+            pass
 
-    return FileResponse(
-        path=output_path,
-        media_type="audio/wav",
-        filename="output.wav",
-        headers={"X-Speaker": speaker}
-    )
-
-@app.get("/speakers")
-def get_speakers():
     return {
-        "male": male_speakers,
-        "female": female_speakers,
-        "languages": SUPPORTED_LANGUAGES
+        "speaker": speaker,
+        "file": output_path
     }
