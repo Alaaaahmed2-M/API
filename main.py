@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
 from TTS.api import TTS
@@ -93,18 +94,19 @@ def generate_tts(req: TTSRequest):
 
         temp_files.append(temp_file)
 
-    for f in temp_files:
-        combined_audio += AudioSegment.from_wav(f)
+    for file in temp_files:
+        combined_audio += AudioSegment.from_wav(file)
 
     combined_audio.export(output_path, format="wav")
 
-    for f in temp_files:
+    for file in temp_files:
         try:
-            os.remove(f)
-        except:
+            os.remove(file)
+        except Exception:
             pass
 
-    return {
-        "speaker": speaker,
-        "file": output_path
-    }
+    return FileResponse(
+        path=output_path,
+        media_type="audio/wav",
+        filename=os.path.basename(output_path)
+    )
