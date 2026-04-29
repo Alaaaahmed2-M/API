@@ -2,3 +2,4 @@ fastapi
 uvicorn
 TTS
 pydub
+python-multipart
